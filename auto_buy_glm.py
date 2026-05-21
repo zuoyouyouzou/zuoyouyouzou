@@ -47,6 +47,7 @@ SELECTORS = {
     "balance_radio": 'text=余额',
     "pay_btn": 'button:has-text("支付"), button:has-text("确认支付")',
     "success_msg": 'text=购买成功, text=订阅成功, text=支付成功',
+    "busy_msg": 'text=人数过多, text=请稍后, text=当前人数较多',
 }
 
 REFRESH_INTERVAL = 0.3
@@ -212,29 +213,74 @@ async def wait_for_available(page) -> bool:
     return False
 
 
-async def execute_purchase(page) -> bool:
-    try:
-        # 1. 确保 Lite + 连续包月选中
-        for sel_name in ["lite_tab", "monthly_radio"]:
-            try:
-                el = page.locator(SELECTORS[sel_name]).first
-                if await el.is_visible(timeout=200):
-                    await el.click()
-                    await page.wait_for_timeout(150)
-                    log.info("已选择: %s", sel_name)
-            except Exception:
-                pass
+async def select_lite_monthly(page):
+    """确保 Lite + 连续包月被选中"""
+    for sel_name in ["lite_tab", "monthly_radio"]:
+        try:
+            el = page.locator(SELECTORS[sel_name]).first
+            if await el.is_visible(timeout=200):
+                await el.click()
+                await page.wait_for_timeout(100)
+        except Exception:
+            pass
 
-        # 2. 点击购买
+
+async def click_buy_with_busy_retry(page, max_retries=10) -> bool:
+    """点击购买按钮，遇到'人数过多'自动刷新重试，直到确认页面出现"""
+    for i in range(max_retries):
+        # 选择套餐
+        await select_lite_monthly(page)
+
+        # 找购买按钮
         btn = await find_buy_button(page)
         if not btn:
-            log.error("找不到购买按钮")
+            log.error("[%s] 购买按钮消失", ts())
             return False
-        log.info("[%s] 点击购买!", ts())
-        await btn.click()
-        await page.wait_for_timeout(500)
 
-        # 3. 同意协议
+        log.info("[%s] 点击购买 (第%d次)", ts(), i + 1)
+        await btn.click()
+        await page.wait_for_timeout(300)
+
+        # 检测"人数过多"
+        try:
+            busy = page.locator(SELECTORS["busy_msg"]).first
+            if await busy.is_visible(timeout=500):
+                log.info("[%s] 检测到'人数过多'，刷新重试...", ts())
+                await page.reload(wait_until="domcontentloaded")
+                continue
+        except Exception:
+            pass
+
+        # 检测确认按钮是否出现
+        try:
+            confirm = page.locator(SELECTORS["confirm_btn"]).first
+            if await confirm.is_visible(timeout=300):
+                log.info("[%s] 确认页面已出现!", ts())
+                return True
+        except Exception:
+            pass
+
+        # 短暂等待后再次检测确认按钮
+        try:
+            confirm = page.locator(SELECTORS["confirm_btn"]).first
+            await confirm.wait_for(state="visible", timeout=2000)
+            log.info("[%s] 确认页面出现!", ts())
+            return True
+        except PWTimeout:
+            log.info("[%s] 未进入确认页，刷新重试...", ts())
+            await page.reload(wait_until="domcontentloaded")
+
+    log.error("重试%d次仍未进入确认页面", max_retries)
+    return False
+
+
+async def execute_purchase(page) -> bool:
+    try:
+        # 1. 点击购买，处理"人数过多"重试
+        if not await click_buy_with_busy_retry(page):
+            return False
+
+        # 2. 同意协议
         try:
             cb = page.locator(SELECTORS["agree_checkbox"]).first
             if await cb.is_visible(timeout=2000) and not await cb.is_checked():
@@ -243,17 +289,16 @@ async def execute_purchase(page) -> bool:
         except Exception:
             pass
 
-        # 4. 确认
+        # 3. 确认
         try:
             confirm = page.locator(SELECTORS["confirm_btn"]).first
-            await confirm.wait_for(state="visible", timeout=5000)
             await confirm.click()
             log.info("[%s] 已点击确认", ts())
             await page.wait_for_timeout(1000)
-        except PWTimeout:
-            log.warning("确认按钮未出现，继续尝试支付")
+        except Exception:
+            log.warning("确认按钮点击失败，继续尝试支付")
 
-        # 5. 选择余额支付
+        # 4. 选择余额支付
         try:
             bal = page.locator(SELECTORS["balance_radio"]).first
             if await bal.is_visible(timeout=2000):
@@ -262,7 +307,7 @@ async def execute_purchase(page) -> bool:
         except Exception:
             pass
 
-        # 6. 支付
+        # 5. 支付
         try:
             pay = page.locator(SELECTORS["pay_btn"]).first
             await pay.wait_for(state="visible", timeout=10000)
@@ -271,7 +316,7 @@ async def execute_purchase(page) -> bool:
         except PWTimeout:
             log.warning("支付按钮未出现")
 
-        # 7. 检查结果
+        # 6. 检查结果
         await page.wait_for_timeout(1500)
         try:
             success = page.locator(SELECTORS["success_msg"]).first
@@ -291,6 +336,51 @@ async def execute_purchase(page) -> bool:
 
 # ============ 主流程 ============
 
+async def pre_monitor(page) -> bool:
+    """09:59:57 起高频监控，一旦按钮出现立即抢购，持续到 10:00:00"""
+    target = beijing_now().replace(hour=10, minute=0, second=0, microsecond=0)
+    if beijing_now() >= target:
+        return False  # 已经过了 10:00
+
+    wait_until(9, 59, 57)
+    log.info("[%s] 开始高频预监控 (0.5s/轮)", ts())
+
+    last_state = None
+    while datetime.now(UTC8) < target:
+        try:
+            await page.reload(wait_until="domcontentloaded")
+
+            sold_out = False
+            for sel_text in SELECTORS["sold_out_badge"].split(", "):
+                try:
+                    if await page.locator(sel_text.strip()).first.is_visible(timeout=200):
+                        sold_out = True
+                        break
+                except Exception:
+                    pass
+
+            current_state = "sold_out" if sold_out else "available"
+            if current_state != last_state:
+                log.info("[%s] 状态变更: %s → %s", ts(), last_state, current_state)
+                last_state = current_state
+
+            if current_state == "available":
+                log.info("[%s] 提前开放! 立即抢购!", ts())
+                success = await execute_purchase(page)
+                if success:
+                    return True
+                log.info("[%s] 购买未完成，继续监控...", ts())
+                last_state = None  # 重置状态，继续循环
+
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            log.debug("预监控出错: %s", e)
+            await asyncio.sleep(0.5)
+
+    log.info("[%s] 已到 10:00，进入正式抢购", ts())
+    return False
+
+
 async def run_once(headless: bool = False):
     log.info("=" * 50)
     log.info("GLM Coding 自动抢购 - %s", beijing_now().isoformat())
@@ -304,13 +394,15 @@ async def run_once(headless: bool = False):
                 return False
             log.info("登录状态: OK")
 
-            # 提前预加载页面，到点直接刷新
+            # 提前预加载页面
             log.info("预加载页面...")
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
-            log.info("等待目标时间 10:00:00 ...")
-            wait_until(10, 0, 0)
-            log.info("[%s] 到点! 开始抢购!", ts())
 
+            # 09:59:57 开始高频预监控，抢跑
+            if await pre_monitor(page):
+                return True
+
+            # 10:00 正式抢购，含重试
             for attempt in range(4):
                 if attempt > 0:
                     log.info("第 %d 次重试...", attempt)
