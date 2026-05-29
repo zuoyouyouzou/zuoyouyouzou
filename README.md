@@ -34,8 +34,8 @@ python auto_buy_glm.py --headless
 1. `Win + R` → `taskschd.msc`
 2. 创建基本任务 → **名称**: `GLM Auto Buy` → **触发器**: 每天 → **时间**: `09:59:55`
 3. **操作**: 启动程序
-   - 程序: `D:\mini_project\run_buy.bat`
-   - 起始于: `D:\mini_project`
+   - 程序: `run_buy.bat`
+
 4. 右键任务 → 属性:
    - **常规**: 勾选"不管用户是否登录都要运行"，勾选"使用最高权限运行"
    - **条件**: 取消"仅当计算机使用交流电源时才启动此任务"（笔记本需要）
