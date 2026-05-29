@@ -21,8 +21,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 4. **触发器**: 每天，开始日期选今天
 5. **时间**: `09:59:55`
 6. **操作**: 启动程序
-   - 程序: `D:\mini_project\run_buy.bat`
-   - 起始于: `D:\mini_project`
+   - 程序: `run_buy.bat`
+   
 7. 完成创建后，右键任务 → 属性：
    - **常规**: 勾选 "不管用户是否登录都要运行"，勾选 "使用最高权限运行"
    - **条件**: 取消 "仅当计算机使用交流电源时才启动此任务"（笔记本需要）
