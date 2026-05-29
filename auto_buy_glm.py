@@ -48,6 +48,7 @@ SELECTORS = {
     "pay_btn": 'button:has-text("支付"), button:has-text("确认支付")',
     "success_msg": 'text=购买成功, text=订阅成功, text=支付成功',
     "busy_msg": 'text=人数过多, text=请稍后, text=当前人数较多',
+    "captcha_mask": '#tCaptchaMaskLayer, .tencent-captcha__mask-layer, [class*=captcha]',
 }
 
 REFRESH_INTERVAL = 0.3
@@ -105,6 +106,13 @@ async def init_browser(playwright, headless: bool = False):
             "--disable-gpu",
             "--disable-dev-shm-usage",
             "--disable-setuid-sandbox",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--disable-default-apps",
+            "--mute-audio",
+            "--hide-scrollbars",
         ],
     )
 
@@ -156,6 +164,26 @@ async def login_flow(page):
 
 
 async def find_buy_button(page):
+    """查找购买按钮，优先定位 Lite 套餐卡内的按钮"""
+    # 优先：查找 Lite 套餐专属按钮
+    lite_specific = [
+        '[class*=card]:has-text("Lite") button:has-text("订阅")',
+        '[class*=package]:has-text("Lite") button:has-text("订阅")',
+        '[class*=plan]:has-text("Lite") button:has-text("订阅")',
+        '[class*=card]:has-text("Lite") button:has-text("购买")',
+        '[class*=package]:has-text("Lite") button:has-text("购买")',
+        '[class*=plan]:has-text("Lite") button:has-text("购买")',
+    ]
+    for sel in lite_specific:
+        try:
+            el = page.locator(sel).first
+            if await el.count() > 0 and await el.is_visible(timeout=200):
+                log.info("找到Lite专属按钮: %s", sel)
+                return el
+        except Exception:
+            continue
+
+    # 回退：全局搜索
     candidates = [
         'button:has-text("立即购买")',
         'button:has-text("立即订阅")',
@@ -213,6 +241,76 @@ async def wait_for_available(page) -> bool:
     return False
 
 
+async def force_click(page, btn, timeout=3):
+    """强制点击按钮，先尝试 force click，失败则用 JS 直接触发 click 事件"""
+    try:
+        await btn.click(force=True, timeout=timeout * 1000)
+    except Exception:
+        try:
+            await btn.evaluate("element => element.click()")
+        except Exception:
+            # 终极手段：page.evaluate + 选择器
+            try:
+                await page.evaluate("""
+                    (selector) => {
+                        const el = document.querySelector(selector) ||
+                                   [...document.querySelectorAll('button')]
+                                       .find(b => b.textContent.includes('订阅') || b.textContent.includes('购买'));
+                        if (el) el.click();
+                    }
+                """, "button")
+            except Exception as e:
+                log.warning("所有点击方式均失败: %s", e)
+                raise
+
+
+async def check_captcha(page) -> bool:
+    """检测腾讯验证码是否弹出"""
+    try:
+        mask = page.locator(SELECTORS["captcha_mask"]).first
+        if await mask.is_visible(timeout=500):
+            log.warning("[%s] 检测到验证码弹出!", ts())
+            await page.screenshot(path="captcha_screenshot.png")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def browser_warmup(page):
+    """模拟人类浏览行为，降低触发验证码概率；先刷新页面确保内容最新"""
+    log.info("[%s] 浏览器预热...", ts())
+    try:
+        await page.reload(wait_until="domcontentloaded")
+        await page.evaluate("window.scrollTo({top: 300, behavior: 'instant'})")
+        await asyncio.sleep(0.4)
+        await page.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
+        await asyncio.sleep(0.3)
+        for sel in ["lite_tab", "monthly_radio"]:
+            try:
+                el = page.locator(SELECTORS[sel]).first
+                if await el.is_visible(timeout=300):
+                    await el.hover()
+                    await asyncio.sleep(0.2)
+            except Exception:
+                pass
+        log.info("[%s] 预热完成", ts())
+    except Exception as e:
+        log.debug("预热出错: %s", e)
+
+
+async def block_resources(page):
+    """拦截图片/字体/媒体请求，加速抢购期间的页面刷新"""
+    await page.route(
+        "**/*",
+        lambda route: (
+            route.abort()
+            if route.request.resource_type in {"image", "media", "font", "stylesheet"}
+            else route.continue_()
+        ),
+    )
+
+
 async def select_lite_monthly(page):
     """确保 Lite + 连续包月被选中"""
     for sel_name in ["lite_tab", "monthly_radio"]:
@@ -225,50 +323,75 @@ async def select_lite_monthly(page):
             pass
 
 
-async def click_buy_with_busy_retry(page, max_retries=10) -> bool:
-    """点击购买按钮，遇到'人数过多'自动刷新重试，直到确认页面出现"""
+async def click_buy_with_busy_retry(page, max_retries=15) -> bool:
+    """点击购买按钮，强制点击 + 人数过多重试 + 验证码检测"""
+    base_url = page.url
     for i in range(max_retries):
-        # 选择套餐
+        # 检测验证码
+        if await check_captcha(page):
+            log.error("[%s] 验证码阻断，需人工处理! 查看 captcha_screenshot.png", ts())
+            return False
+
         await select_lite_monthly(page)
 
-        # 找购买按钮
         btn = await find_buy_button(page)
         if not btn:
             log.error("[%s] 购买按钮消失", ts())
             return False
 
-        log.info("[%s] 点击购买 (第%d次)", ts(), i + 1)
-        await btn.click()
-        await page.wait_for_timeout(300)
+        log.info("[%s] 强制点击购买 (第%d次)", ts(), i + 1)
+        try:
+            await force_click(page, btn, timeout=3)
+        except Exception:
+            log.warning("[%s] 点击失败(3s超时)，刷新重试...", ts())
+            await page.reload(wait_until="domcontentloaded")
+            continue
+
+        # 快速等待页面响应
+        await page.wait_for_timeout(200)
+
+        # 检测验证码 (可能在点击后弹出)
+        if await check_captcha(page):
+            log.error("[%s] 点击后弹出验证码，需人工处理!", ts())
+            return False
 
         # 检测"人数过多"
         try:
             busy = page.locator(SELECTORS["busy_msg"]).first
-            if await busy.is_visible(timeout=500):
+            if await busy.is_visible(timeout=1000):
                 log.info("[%s] 检测到'人数过多'，刷新重试...", ts())
                 await page.reload(wait_until="domcontentloaded")
                 continue
         except Exception:
             pass
 
-        # 检测确认按钮是否出现
+        # 检测页面跳转 (URL 变化)
+        current_url = page.url
+        if current_url != base_url and current_url != TARGET_URL:
+            log.info("[%s] 页面已跳转: %s", ts(), current_url)
+            return True
+
+        # 检测确认按钮
         try:
             confirm = page.locator(SELECTORS["confirm_btn"]).first
-            if await confirm.is_visible(timeout=300):
-                log.info("[%s] 确认页面已出现!", ts())
+            await confirm.wait_for(state="visible", timeout=3000)
+            log.info("[%s] 确认页面已出现!", ts())
+            return True
+        except PWTimeout:
+            pass
+
+        # 检测是否有新弹窗/对话框出现 (Element-UI dialog)
+        try:
+            dialog = page.locator(".el-dialog, .el-message-box, [role=dialog], .modal, .popup").first
+            if await dialog.is_visible(timeout=500):
+                log.info("[%s] 检测到弹窗/对话框出现", ts())
+                await page.screenshot(path="dialog_screenshot.png")
                 return True
         except Exception:
             pass
 
-        # 短暂等待后再次检测确认按钮
-        try:
-            confirm = page.locator(SELECTORS["confirm_btn"]).first
-            await confirm.wait_for(state="visible", timeout=2000)
-            log.info("[%s] 确认页面出现!", ts())
-            return True
-        except PWTimeout:
-            log.info("[%s] 未进入确认页，刷新重试...", ts())
-            await page.reload(wait_until="domcontentloaded")
+        log.info("[%s] 未进入确认页，刷新重试...", ts())
+        await page.reload(wait_until="domcontentloaded")
 
     log.error("重试%d次仍未进入确认页面", max_retries)
     return False
@@ -342,7 +465,17 @@ async def pre_monitor(page) -> bool:
     if beijing_now() >= target:
         return False  # 已经过了 10:00
 
-    wait_until(9, 59, 57)
+    wait_until(9, 59, 52)
+    await browser_warmup(page)
+    # 预热完成后根据当前时间决定行为，而非盲目 wait_until
+    now = beijing_now()
+    if now >= target:
+        log.info("[%s] 预热耗时过长已过10:00，进入正式抢购", ts())
+        return False
+    if now >= target.replace(minute=59, second=57):
+        log.info("[%s] 预热完成时已过09:59:57，直接开始预监控", ts())
+    else:
+        wait_until(9, 59, 57)
     log.info("[%s] 开始高频预监控 (0.5s/轮)", ts())
 
     last_state = None
@@ -397,6 +530,9 @@ async def run_once(headless: bool = False):
             # 提前预加载页面
             log.info("预加载页面...")
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+
+            # 抢购期间屏蔽图片/字体/媒体，加速页面刷新
+            await block_resources(page)
 
             # 09:59:57 开始高频预监控，抢跑
             if await pre_monitor(page):
