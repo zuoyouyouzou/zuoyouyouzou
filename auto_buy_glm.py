@@ -163,6 +163,29 @@ async def login_flow(page):
     log.info("登录状态已保存到 %s 目录", USER_DATA_DIR)
 
 
+async def dump_page_buttons(page):
+    """调试：打印页面上所有可见按钮的文本和类名"""
+    try:
+        buttons = page.locator("button")
+        count = await buttons.count()
+        visible = []
+        for i in range(min(count, 30)):
+            try:
+                btn = buttons.nth(i)
+                if await btn.is_visible(timeout=100):
+                    text = (await btn.inner_text()).strip()[:50]
+                    cls = (await btn.get_attribute("class") or "")[:60]
+                    visible.append(f"  [{i}] text={text!r} class={cls!r}")
+            except Exception:
+                continue
+        if visible:
+            log.info("页面上可见按钮 (%d/%d):\n%s", len(visible), count, "\n".join(visible))
+        else:
+            log.info("页面上未见可见按钮 (共 %d 个)", count)
+    except Exception as e:
+        log.debug("dump_page_buttons 出错: %s", e)
+
+
 async def find_buy_button(page):
     """查找购买按钮，优先定位 Lite 套餐卡内的按钮"""
     # 优先：查找 Lite 套餐专属按钮
@@ -173,12 +196,22 @@ async def find_buy_button(page):
         '[class*=card]:has-text("Lite") button:has-text("购买")',
         '[class*=package]:has-text("Lite") button:has-text("购买")',
         '[class*=plan]:has-text("Lite") button:has-text("购买")',
+        # 新增：更宽泛的 Lite 卡片内按钮匹配
+        '[class*=card]:has-text("Lite") button',
+        '[class*=item]:has-text("Lite") button:has-text("订阅")',
+        '[class*=item]:has-text("Lite") button:has-text("购买")',
+        '[class*=box]:has-text("Lite") button:has-text("订阅")',
+        '[class*=box]:has-text("Lite") button:has-text("购买")',
+        # 新增：Coding Lite 相关
+        'button:has-text("Coding")',
+        '[class*=card]:has-text("Coding") button',
     ]
     for sel in lite_specific:
         try:
             el = page.locator(sel).first
             if await el.count() > 0 and await el.is_visible(timeout=200):
-                log.info("找到Lite专属按钮: %s", sel)
+                text = (await el.inner_text()).strip()[:30] if await el.count() > 0 else ""
+                log.info("找到Lite专属按钮: %s → %s", sel, text)
                 return el
         except Exception:
             continue
@@ -189,10 +222,19 @@ async def find_buy_button(page):
         'button:has-text("立即订阅")',
         'button:has-text("购买")',
         'button:has-text("订阅")',
+        'button:has-text("开通")',
+        'button:has-text("续费")',
+        'button:has-text("抢购")',
         'a:has-text("立即购买")',
         'a:has-text("订阅")',
+        'a:has-text("购买")',
         '[class*=buy]',
         '[class*=purchase]',
+        '[class*=subscribe]',
+        # 新增：el-button 类型
+        'button.el-button--primary',
+        '.el-button:has-text("订阅")',
+        '.el-button:has-text("购买")',
     ]
     for sel in candidates:
         try:
@@ -203,12 +245,32 @@ async def find_buy_button(page):
                 return el
         except Exception:
             continue
+
+    # 调试：打印页面上所有按钮
+    log.warning("未找到购买按钮，打印页面调试信息...")
+    await dump_page_buttons(page)
+    await page.screenshot(path="debug_no_button.png")
+    # 保存页面 HTML 片段（body 内的主要内容）
+    try:
+        html_snippet = await page.evaluate("""() => {
+            const body = document.body;
+            if (!body) return 'NO_BODY';
+            // 只取前 3000 字符的关键结构
+            return body.innerHTML.substring(0, 5000);
+        }""")
+        with open("debug_no_button.html", "w", encoding="utf-8") as f:
+            f.write(html_snippet)
+        log.info("调试 HTML 已保存至 debug_no_button.html")
+    except Exception as e:
+        log.debug("保存 HTML 失败: %s", e)
+    log.info("调试截图已保存至 debug_no_button.png")
     return None
 
 
 async def wait_for_available(page) -> bool:
     start = time.time()
     last_state = None
+    no_button_count = 0  # 连续 available 但找不到按钮的次数
     while time.time() - start < 20:
         try:
             await page.reload(wait_until="domcontentloaded")
@@ -232,6 +294,13 @@ async def wait_for_available(page) -> bool:
                 if btn:
                     log.info("[%s] 按钮可用!", ts())
                     return True
+                no_button_count += 1
+                # 连续5次 available 但找不到按钮 → 页面结构可能变了，提前终止
+                if no_button_count >= 5:
+                    log.error("[%s] 连续%d次检测到available但找不到按钮，页面结构可能已变更", ts(), no_button_count)
+                    return False
+            else:
+                no_button_count = 0  # sold_out 状态时重置计数
             await asyncio.sleep(REFRESH_INTERVAL)
         except Exception as e:
             log.debug("刷新出错: %s", e)
@@ -300,12 +369,12 @@ async def browser_warmup(page):
 
 
 async def block_resources(page):
-    """拦截图片/字体/媒体请求，加速抢购期间的页面刷新"""
+    """拦截图片/字体/媒体请求，加速抢购期间的页面刷新（不拦截 CSS，避免影响页面渲染）"""
     await page.route(
         "**/*",
         lambda route: (
             route.abort()
-            if route.request.resource_type in {"image", "media", "font", "stylesheet"}
+            if route.request.resource_type in {"image", "media", "font"}
             else route.continue_()
         ),
     )
@@ -479,6 +548,7 @@ async def pre_monitor(page) -> bool:
     log.info("[%s] 开始高频预监控 (0.5s/轮)", ts())
 
     last_state = None
+    consecutive_failures = 0
     while datetime.now(UTC8) < target:
         try:
             await page.reload(wait_until="domcontentloaded")
@@ -502,8 +572,14 @@ async def pre_monitor(page) -> bool:
                 success = await execute_purchase(page)
                 if success:
                     return True
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    log.warning("[%s] 预监控阶段连续%d次抢购失败，等待正式抢购", ts(), consecutive_failures)
+                    break
                 log.info("[%s] 购买未完成，继续监控...", ts())
                 last_state = None  # 重置状态，继续循环
+            else:
+                consecutive_failures = 0
 
             await asyncio.sleep(0.5)
         except Exception as e:
@@ -552,6 +628,12 @@ async def run_once(headless: bool = False):
                 log.warning("购买流程未完成")
 
             log.error("全部 %d 次尝试均失败", 4)
+            # 保存最终状态便于排查
+            try:
+                await page.screenshot(path="final_state.png")
+                log.info("最终页面截图已保存至 final_state.png")
+            except Exception:
+                pass
             return False
         finally:
             if not headless:
@@ -589,6 +671,11 @@ async def dry_run():
                     log.info("  %s (%s): %d 个元素", name, sel, cnt)
                 except Exception as e:
                     log.info("  %s: 定位失败 - %s", name, e)
+            log.info("--- 页面按钮列表 ---")
+            await dump_page_buttons(page)
+            log.info("--- 查找购买按钮 ---")
+            btn = await find_buy_button(page)
+            log.info("find_buy_button 结果: %s", "找到" if btn else "未找到")
         finally:
             await context.close()
 
